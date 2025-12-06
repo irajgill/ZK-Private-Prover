@@ -1,312 +1,565 @@
-## Züs TEE‑ZK Prover + Vult – Architectural Overview
+# Züs ZK Prover
 
-This document walks through how our **ZK Prover** works with **Vult** to enable **private transactions** on any chain.  
-
----
-
-## 1. Components at a Glance
-
-- **Vult (user wallet / app)**  
-  - Where the user lives: mobile / desktop / browser.  
-  - Holds user keys, talks to Züs storage, the TEE, and L1/L2 chains.  
-  - Uses the `user-client` SDK under the hood (`transaction-orchestrator`, `TEEClient`, `X402Client`, etc.).
-
-- **TEE Server (“Prover”)**  
-  - Our prover backend, running inside a Trusted Execution Environment.  
-  - Fetches encrypted data from Züs, decrypts **only inside the enclave**, runs zkSNARK circuits, signs the result, and writes proofs back to storage.
-  - When built with `-tags=gnark`, it runs **Groth16 over BN254** using gnark.
-
-- **dApp / Batch Server**  
-  - Backend for dApp‑driven flows and batch processing.  
-  - Encrypts batches of transactions, manages **split‑keys**, uploads encrypted blobs to Züs, and calls the TEE batch API.
-
-- **Züs Storage**  
-  - Decentralized storage network used for all payloads and proof artifacts.  
-  - Access is controlled via **auth tickets** (Flow 1) and **split‑keys + grants** (Flow 2).
-
-- **L1/L2 Chains (e.g. Base Sepolia)**  
-  - Where we **anchor proofs** and, eventually, verify proofs on‑chain.  
-  - Current contracts:
-    - `TxHashVerifier.sol` – Groth16 verifier for our `txHashCircuit`.  
-    - `ZkTxHashRegistry.sol` – simple registry of `(jobIdHash, proofHash)`.  
-    - `TxProofRegistry.sol` – wrapper that verifies a proof via `TxHashVerifier` and then records its hash in `ZkTxHashRegistry`.
 
 ---
 
-## 2. Flow 1 – Individual User Flow (PRE)
+## 1. Goals & High‑Level Concept
 
-Flow 1 is the “single user, single transaction” journey. The mental model is:
+Our Züs TEE–ZK Prover is a privacy and integrity layer for any wallet or dApp that wants to execute **private, verifiable transactions** on public blockchains (L1/L2) using **Züs storage + TEEs + zkSNARKs**.
 
-> “Encrypt on the client, share *only* with the TEE, let the TEE prove correctness, then revoke access.”
+At a high level:
 
-### 2.1. High‑Level Sequence
+- Users (via **Vult** mobile/desktop/browser) or dApps send **encrypted transactions** to Züs.
+- A **TEE server** running inside a hardware enclave pulls those encrypted transactions from Züs, **decrypts them in‑enclave**, and runs a **zero‑knowledge circuit** (Groth16 on BN254 via gnark) that proves a statement about the transaction (Phase 1: "this proof is bound to this transaction hash").
+- The TEE returns a **signed proof bundle** + attestation. For Flow 1 (user) this bundle is written to a dedicated TEE allocation; for Flow 2 (dApp/batch) the bundle is written back into the **dApp’s own Züs allocation** under a split key.
+- The **user or dApp** verifies the proof bundle and can then:
+  - Submit a transaction to an L1/L2 (Ethereum/Base etc.) that carries the proof.
+  - Or, in Phase 1, anchor the proof hash on L1 via the `ZkTxHashRegistry`/`TxProofRegistry` contracts on Base Sepolia.
+- **x402** sits in front of TEE and dApp endpoints, allowing us to gate access on cryptographic micropayments (USDC/ADA/NIGHT via facilitator).
+- **Key & data lifecycles** (PRE auth tickets, split-keys, allocations) are designed so that the TEE’s access window is narrowly bounded and revocable, limiting blast radius in case of any compromise.
+
+---
+
+## 2. Components & Deployment Topology
+
+### 2.1 Major Components
+
+- **Vult Clients (mobile / desktop / browser)**
+  - User‑facing apps that initiate private transfers, view proofs, share encrypted history, and manage x402 payments.
+  - Built on top of the `user-client` SDK (TypeScript).
+
+- **User‑Client SDK (`user-client/`)**
+  - `transaction-orchestrator.ts`: orchestrates Flow 1 (PRE‑based private transaction) from a wallet’s perspective.
+  - `tee-client.ts`: HTTP client for the TEE server, including x402 handling and signature verification.
+  - `x402-client.ts`: x402 payment client that parses `402 Payment Required` responses, talks to a facilitator, and attaches `X-Payment-*` headers.
+  - `l1-registry-client.ts`: thin ethers.js client for L1 registries (e.g. `ZkTxHashRegistry` on Base/Ethereum).
+  - `sdk.ts`: high‑level orchestration helpers (`runFlow1WithEnv`, `runFlow1AndRecordOnL1WithEnv`, `runFlow2AndRecordOnL1WithEnv`).
+
+- **TEE Server (`tee-server/`)**
+  - **API layer** (`internal/api/handlers.go`, `internal/api/orchestrator.go`, `internal/api/batch_handler.go`):
+    - `/attestation`: returns the enclave’s attestation bundle plus TEE public keys.
+    - `/api/tee/jobs/data-request`: Flow 1 asynchronous proving via auth tickets.
+    - `/api/tee/jobs/:id`: job status polling.
+    - `/api/tee/jobs/:id/proof-ticket`: returns signed proof bundle & retrieval ticket.
+    - `/api/tee/prove`: synchronous Flow 1 proving endpoint.
+    - `/api/tee/batch/process`: Flow 2 batch proving under split‑keys.
+  - **Prover (`internal/prover/`)**:
+    - `circuit_gnark.go`: `txHashCircuit` (Groth16 on BN254) + `gnarkCircuitProver`.
+    - `prover.go`: `Service.GenerateProof` that uses gnark when built with `-tags=gnark`, otherwise falls back to a deterministic mock (dev‑only).
+  - **Storage (`internal/storage/`)**:
+    - Downloads encrypted txs from Züs (user allocations) via zbox/GoSDK.
+    - Uploads encrypted proof bundles to TEE allocations via GoSDK + zbox fallback.
+  - **Attestation (`internal/attestation/`)**:
+    - Constructs `TEEMetadata` with `server_id`, `client_id`, `MREnclave`, `TEEAttestationPackage`, etc.
+  - **x402 Paywall (`internal/payments/x402/`)**:
+    - Wraps sensitive endpoints with `Paywall.Require`, which returns HTTP 402 + x402 instructions unless a valid `X-Payment-ID`/`X-Payment-Token` is present (or `X402_DEV_BYPASS` with `dev-*` IDs in dev).
+
+- **dApp Server (`dapp-server/`)**
+  - **API (`internal/api/handlers.go`)**:
+    - `/batch/submit`: Flow 2 batch submission with `allocation_id`, `transactions[]`, `key_ttl_seconds`, `user_id`.
+    - `/batch/status/:batchId`, `/batch/results/:batchId`, `/batch/cancel/:batchId`, `/transactions/:txId`.
+  - **Batch Uploader (`internal/batch/uploader.go`)**:
+    - Generates a symmetric key via `splitkey.Manager`.
+    - Encrypts each tx with AES‑GCM and uploads to the (real) dApp Züs allocation via GoSDK + zbox fallback.
+    - Grants the TEE temporary access to the key via `GrantTeeAccess` (split‑key infra), automatically revoked via `RevokeAllForKey` when the batch finishes.
+  - **Split-Key Infra (`internal/splitkey/`)**:
+    - `Manager`: creates per‑batch keys and issues HMAC‑signed `Grant` objects (`key_id`, `allocation_id`, `expires_at`, `permissions`, `signature_b64`).
+    - `zauth_hmac.go`: `HMACGrantVerifier` calculates HMAC‑SHA256 over {key_id, allocation_id, expires_at, permissions}.
+  - **x402 Paywall (`internal/payments/x402/`)**:
+    - `Paywall.Require` protects `/batch/submit`, returning x402 JSON + `X-Payment-*` headers when payment is required.
+
+- **Züs Network**
+  - **Blobbers**: store encrypted tx and proof blobs under allocations (`user_alloc`, `dapp_alloc`, `tee_alloc`) with consensus guarantees.
+  - **GoSDK & zbox**: our libraries/CLI to create allocations, upload/download, and mint/preauth tickets.
+
+- **L1 / L2 Contracts (Base Sepolia demo)**
+  - `TxHashVerifier` (`contracts/TxHashVerifier.sol`, deployed):
+    - Groth16 verifier contract for the `txHashCircuit` (BN254); takes `uint256[8] proof, uint256[1] input`.
+  - `ZkTxHashRegistry` (`contracts/ZkTxHashRegistry.sol`, deployed):
+    - Simple `submitProofHash(bytes32 jobIdHash, bytes32 proofHash)` + `ProofInvalid` event; used for anchoring proofs (Flow 1) and batch hashes (Flow 2).
+  - `TxProofRegistry` (`contracts/TxProofRegistry.sol`, deployed):
+    - Calls `TxHashVerifier.verifyProof` with `(proof, [txHash])`.
+    - On success, calls `ZkTxHashRegistry.submitProofHash(jobIdHash, proofHash)` and emits `TxProofVerifiedAndRecorded`.
+
+---
+
+## 3. Flow 1 – Private User Transaction (PRE + TEE + ZK)
+
+### 3.1 Actors & Roles
+
+- **User (via Vult)**: wants to send a private transaction (e.g. transfer 1 USDC to another address) and receive a ZK proof of correct behavior.
+- **User‑Client SDK**: runs in Vult (browser/mobile/electron) and speaks to Züs (zbox/GoSDK) and the TEE server.
+- **TEE Server**: runs inside a secure enclave (mock‑SGX in dev; Nitro/SGX in production), holds a private decryption key and zkSNARK proving key.
+- **L1 Wallet / Tx Submitter**: sends the final on-chain transaction with proof or calls `TxProofRegistry`/`ZkTxHashRegistry`.
+
+### 3.2 Step‑by‑Step Walkthrough
+
+1. **User creates a private transaction in Vult**
+   - User enters:
+     - `amount` (e.g. `1.0`),
+     - `to` (recipient address or identifier),
+     - optional memo.
+   - Vult calls `transaction-orchestrator`’s `runFlow1`:
+
+   ```ts
+   const orchestrator = new TransactionOrchestrator(wallet);
+   const res = await orchestrator.runFlow1({ transaction, blobberUrls });
+   // res: { jobId, allocationId, proofHashHex, ... }
+   ```
+
+2. **Encrypt & upload via Züs (PRE)**
+   - `runFlow1`:
+     - Generates a 256‑bit AES‑GCM key with `EncryptionService.generateKey()`.
+     - Serializes the tx JSON and encrypts it with `encryptBufferAesGcm`.
+     - Calls `zbox newallocation` (if needed) to create a **user allocation** (`~/.zcn/user_alloc.txt`) on Züs devnet.
+     - Uses `zbox upload` to store `tx.phase1.<timestamp>.json` (the encrypted tx) into the user’s allocation.
+
+3. **AuthTicket & PRE sharing**
+   - From the user’s Curve25519 key pair and the TEE’s Curve25519 public key (delivered via `/attestation`), `ProxyReEncryption`:
+     - Derives a **re‑encryption key** `reKeyB64`.
+     - Calls `zbox share --encryptionpublickey <TEE_curve25519_pub>` to create an **auth ticket** that:
+       - Grants the TEE read access to `/tx.phase1...json` in the user’s allocation.
+       - Embeds an expiry time (e.g. 3600 seconds).
+       - Optionally includes `fileContentHash`, `client_id`, etc.
+   - If `zbox share` fails (e.g. CLI output format changed), we fall back to constructing and signing the ticket client‑side using `ProxyReEncryption.buildAuthTicket` + `.signAuthTicket`.
+
+4. **Submit job to the TEE**
+   - `TEEClient.sendAuthTicket(authTicketB64)`:
+
+```ts
+const jobId = await tee.sendAuthTicket(authTicketB64);
+// internally:
+// POST /api/tee/jobs/data-request { auth_ticket_b_number },
+// with HMAC signature headers and optional x402 payment handling.
+```
+
+5. **TEE: download, decrypt & prove**
+
+Sequence (simplified):
 
 ```mermaid
 sequenceDiagram
-    participant User as Vult (User)
-    participant ZUS as Züs Storage
-    participant TEE as TEE Prover
-    participant L1 as L1/L2 Chain (optional)
+    participant V as Vult (User Client)
+    participant Z as Züs Blobbers
+    participant T as TEE Server
 
-    User->>ZUS: Upload encrypted tx (AES‑GCM)
-    User->>TEE: Get attestation (client_id, pubkeys)
-    User->>ZUS: Submit PRE auth ticket (ShareInfo)
-    User->>TEE: POST /jobs/data-request (auth_ticket_b64)
-    TEE->>ZUS: Download & decrypt inside enclave
-    TEE->>TEE: Run zkSNARK prover (Groth16)
-    TEE->>ZUS: Upload signed proof bundle
-    TEE->>User: Return proof retrieval ticket
-    User->>ZUS: Download proof bundle (verify Ed25519 + attestation)
-    User->>ZUS: Submit revocation ticket (expire PRE access)
-    User->>L1: (Optional) Anchor proof hash in ZkTxHashRegistry
+    V->>Z: zbox upload: /tx.phase1.<ts>.json (AES-GCM ciphertext)
+    V->>Z: zbox share -> AuthTicket_b64 (PRE key, TTL)
+    V->>T: POST /api/tee/jobs/data-request { auth_ticket_b64 }
+    T->>Z: DownloadWithAuthTicket(auth_ticket_b64, /tx.phase1.<ts>.json)
+    T->>T: Decrypt AES-GCM in enclave
+    T->>T: Compute tx.Hash = sha256(plaintext)
+    T->>T: gnark Groth16 Prove(txHashCircuit, public Hash=tx.Hash)
+    T->>T: Build ProofOutput{ proof, public_signals, circuit_id, proof_type="groth16", verifier_key_id="txhash_bn254_v1" }
+    T->>T: Build TEEMetadata + TEESignature
+    T->>Z: UploadEncryptedFile(enc(SignedProofBundle)) -> /tee/proofs/<jobId>.json
+    T->>V: /api/tee/jobs/:id/proof-ticket -> { proof: ProofOutput, tee_metadata, auth_ticket_b64, remote_path }
 ```
 
-### 2.2. What Actually Happens (Implementation View)
+6. **User retrieves & verifies the proof**
+   - In `runFlow1` and `test-phase1-e2e`:
+     - The client obtains a **proof retrieval ticket** from `/api/tee/jobs/:id/proof-ticket`.
+     - Uses either:
+       - `DownloadAndDecryptWithAuthTicket` (through the TEE server), or
+       - `zbox download --authtoken` to pull `/tee/proofs/<jobId>.json` from the TEE allocation.
+     - Verifies:
+       - `TEESignature`: Ed25519 over `SHA256({ proof, tee_metadata })`, matching the `public_key_b64`.
+       - That `proof.proof_type === "groth16"`, `proof.circuit_id` matches expectations, and `verifier_key_id === "txhash_bn254_v1"`.
 
-**Step 1 – Encrypt & upload**
+7. **On-chain settlement / anchoring (Phase 1)**
+   - Using `runFlow1AndRecordOnL1WithEnv`:
 
-- Vult builds a JSON transaction, e.g.:
-  - `{ op: "transfer", payload: { amount: "1.0", to: "alice" }, timestamp: ... }`
-- `EncryptionService`:
-  - Generates a 32‑byte AES‑256 key.  
-  - Encrypts the JSON with AES‑GCM → `{ iv_b64, tag_b64, ciphertext_b64 }`.
-- `AllocationManager`:
-  - Creates an immutable allocation on Züs via `zbox`.  
-  - Uploads the encrypted JSON as `/tx.<timestamp>.json`.
-
-**Step 2 – PRE: granting the TEE temporary access**
-
-- Vult calls `TEEClient.getAttestation()`:
-  - Gets `client_id`, an Ed25519 signing key, and a Curve25519 encryption key.  
-  - Attestation is checked for freshness and bound later to proof metadata.
-- Using `ProxyReEncryption`:
-  - Vult derives a **re‑encryption key** from its own key and the TEE’s encryption key.
-- Vult constructs an **AuthTicket**:
-  - Includes allocation ID, file path, hash of the encrypted payload, TEE client ID, PRE key, and an expiration time.
-  - Signs and **submits it to blobbers** via `zbox share` or a manual ShareInfo flow.
-
-At this point, blobbers know:
-> “For this file, until this timestamp, this TEE may re‑encrypt and download the ciphertext.”
-
-**Step 3 – TEE downloads, decrypts, and proves**
-
-- Vult calls `TEEClient.sendAuthTicket(authTicketB64)`:
-  - TEE enqueues a job and returns a `jobId`.
-  - Vult polls `TEEClient.pollJob(jobId)` until the job reaches `completed` or `failed`.
-- On the TEE side:
-  - Orchestrator (`ProofOrchestrator`) uses the auth ticket to ask Züs for the file.  
-  - Blobbers re‑encrypt the ciphertext so only the TEE’s key can decrypt it.  
-  - Inside the enclave:
-    - The TEE decrypts the blob.  
-    - Parses the transaction JSON.  
-    - Computes a transaction hash `tx.Hash = sha256(JSON)`.  
-    - Calls the prover service (`prover.Service.GenerateProof`):
-      - On gnark builds (`-tags=gnark`), this invokes `gnarkCircuitProver` with our `txHashCircuit`.
-      - Produces a **real Groth16 proof** on BN254, plus:
-        - `circuit_id`,
-        - `proof_type = "groth16"`,
-        - `verifier_key_id = "txhash_bn254_v1"`.
-
-**Step 4 – Signed proof bundle & upload**
-
-- The TEE builds `TEEMetadata`:
-  - Includes server ID, version, attestation blob, and timestamp.
-- It then creates a **canonical payload**:
-  - `{ proof: ProofOutput, tee_metadata: TEEMetadata }`,
-  - Hashes it with SHA‑256 and signs the hash with its **Ed25519** key.  
-- The final format is `SignedProofBundle`:
-
-  - `proof`: proof data + public signals + circuit info.  
-  - `tee_metadata`: TEE identity and attestation.  
-  - `signature`: Ed25519 over the payload hash.
-
-- The bundle is AES‑GCM encrypted and stored in a **TEE‑owned allocation** on Züs.  
-- The TEE issues a **new auth ticket** so the user can download the proof bundle.
-
-**Step 5 – User verification & revocation**
-
-- Vult calls `TEEClient.getProofRetrievalTicket(jobId)` and then uses zbox/HTTP to:
-  - Download the bundle from Züs or directly from the TEE.  
-  - Recompute the payload hash and verify:
-    - Hash matches `signature.payload_hash_hex`.  
-    - Ed25519 signature is valid for the TEE public key from attestation.  
-    - Attestation is present and fresh enough.
-- After verification, Vult:
-  - Sends a **revocation ShareInfo** with an already‑expired timestamp.  
-  - This closes the window during which the TEE can access that file.
-
-**Optional: L1 anchoring**
-
-- The Flow 1 SDK (`runFlow1AndRecordOnL1WithEnv`) already:
-  - Takes `sha256(proofBytes)` as `proofHashHex`,
-  - Calls `ZkTxHashRegistry.submitProofHash(jobIdHash, proofHash)` on L1 (e.g. Base Sepolia),
-  - Returns L1 transaction hashes per chain.
-
----
-
-## 3. Flow 2 – dApp / Batch Flow (Split‑Key)
-
-Flow 2 is designed for dApps or services that want to process **batches of user transactions** privately, with limited‑time access to a dApp‑owned Züs allocation.
-
-### 3.1. High‑Level Sequence
-
-```mermaid
-sequenceDiagram
-    participant DApp as dApp Server
-    participant ZUS as Züs Storage (dApp allocation)
-    participant TEE as TEE Prover
-
-    DApp->>ZUS: Encrypt batch (AES‑GCM), upload to dApp allocation
-    DApp->>DApp: Split key (user + infra components)
-    DApp->>TEE: POST /api/tee/batch/process (grant + entries)
-    TEE->>TEE: Verify grant, reconstruct key
-    TEE->>ZUS: Read & decrypt each tx
-    TEE->>TEE: Run zkSNARK prover for each tx
-    TEE->>ZUS: Write back encrypted SignedProofBundle per tx
-    TEE->>DApp: Return summary (proof paths, hashes)
-    DApp->>ZUS: Download bundles, verify signatures + attestation
-    DApp->>DApp: Mark tx statuses as verified
+```ts
+const { jobId, proofHashHex, l1TxHashes } =
+  await runFlow1AndRecordOnL1WithEnv({ transaction, blobberUrls }, ['base-sepolia']);
 ```
 
-### 3.2. Encrypt & Delegate (dApp side)
+   - The helper:
+     - Re‑runs Flow 1 via zbox and collects `jobId` + `proofHashHex` (SHA‑256 of the proof bundle).
+     - For each configured L1 target (e.g. `BASE_SEPOLIA_*`), calls `submitProofHash` on `ZkTxHashRegistry` (`0x1A1b...`) with:
+       - `jobIdHash = keccak256(jobId)`.
+       - `proofHash = bytes32(proofHashHex)`.
+     - Returns `l1TxHashes` so Vult can show “Proof anchored on Base Sepolia: `<tx-hash>`”.
 
-1. The dApp prepares a list of transactions:
-   - Each tx is a small JSON payload, e.g. `{ op: "transfer", amount: "10", to: "user-123", nonce: 0 }`.
-
-2. The dApp server’s `Uploader`:
-   - Calls the split‑key manager to **create a batch key** (or reuse one for the batch).  
-   - Encrypts each tx with AES‑GCM and writes it to the **dApp allocation** via GoSDK.  
-   - Records:
-     - The remote path (`batches/<batchId>/tx-0.enc`, etc.).  
-     - The ciphertext (as base64) for convenience.
-
-3. The split‑key manager:
-   - Maintains:
-     - A **user component** of the key (stored alongside batch metadata).  
-     - An **infra component** stored in a zAuth‑style service.  
-   - Issues a signed `Grant` (HMAC‑SHA256) that says:
-     - “Key `<KeyID>` for allocation `<AllocationID>` can be used for `batch:process` until `<ExpiresAt>`.”
-
-4. The dApp calls the TEE batch API:
-   - `POST /api/tee/batch/process` with:
-     - `batch_id`, `allocation_id`, `key_id`, `master_key_b64`.  
-     - The **signed grant**.  
-     - The entries, each with `tx_id` and either `ciphertext_b64` or a remote path.
-
-### 3.3. TEE: Batch Prove & Write Back
-
-On the TEE side, `handleBatchProcess` does the following:
-
-1. **Grant verification**  
-   - Checks:
-     - Signature (HMAC with shared secret).  
-     - `allocation_id` + `key_id` match.  
-     - Permissions include `batch:process`.  
-     - Not expired.
-
-2. **Per‑entry processing**  
-   For each batch entry:
-   - Decrypts the ciphertext (AES‑GCM with the batch key).  
-   - Computes a transaction hash.  
-   - Uses `prover.Service.GenerateProof` to run the same **Groth16** circuit as Flow 1.
-   - Builds a `SignedProofBundle` exactly like in Flow 1
-     - (ProofOutput + TEEMetadata + Ed25519 signature).
-   - Encrypts the bundle again with AES‑GCM and writes it back to **the same dApp allocation**, under a `.proof` path.
-
-3. **Response to dApp**  
-   - Returns a concise list of:
-     - `tx_id`, `proof_path`, and `hash_hex` per transaction.
-
-### 3.4. dApp: Verify & Mark Verified
-
-The dApp server:
-
-1. Reconstructs the batch key again.  
-2. Downloads each encrypted bundle from the dApp allocation.  
-3. Decrypts and verifies:
-   - Payload hash, Ed25519 signature, attestation presence.  
-4. If everything checks out:
-   - Writes those encrypted bundles back to its own allocation (for auditability).  
-   - Sets:
-     - Per‑tx status to **`verified`**.  
-     - Batch status to **`completed`**.
-
-An optional monitor can then:
-- Watch for `completed` batches and drive **L1 settlement** (anchoring or full proof verification).
+8. **Key & data lifecycle (Flow 1)**
+   - The auth ticket has a short TTL (e.g. 1 hour).
+   - After proof retrieval, `runFlow1` performs a **best‑effort revocation** by calling `zbox` to revoke the ticket (if supported) or by letting the TTL expire.
+   - TEE only holds plaintext tx data in memory during proving; persistent storage is always **encrypted blobs**:
+     - Original tx: AES‑GCM ciphertext in user’s Züs allocation.
+     - Proof: JSON `SignedProofBundle` encrypted with TEE’s AES‑GCM key in `tee_alloc`.
 
 ---
 
-## 4. Attestation & Trust Model
+## 4. Flow 2 – dApp / Batch Flow (Split‑Key + ZK)
 
-- The TEE exposes `/attestation`:
-  - Carries a TEE identity (`client_id`) and public keys. 
+### 4.1 Actors & Roles
 
-- Every proof bundle includes:
-  - **TEEMetadata**, which includes:
-    - The TEE server ID and version.  
-    - Attestation package (quote, cert chain, PCRs, etc.).  
-  - **TEESignature**, an Ed25519 signature over a canonical JSON payload.
+- **dApp Backend** (or Vult orchestrator in “batch” mode): submits many small txs (e.g. micro‑transactions) as a batch.
+- **dApp Server**: owns a Züs allocation and a split‑key manager, handles `/batch/submit` and proof persistence.
+- **TEE Server**: same as Flow 1, but now proving many txs in a batch using a **reconstructed symmetric key**.
+- **Züs Network**: persists both encrypted inputs (txs) and encrypted proof bundles.
+- **L1 Registry**: anchors batch‑level proof hashes (and, later, full proofs) for auditability.
 
-- Clients (Vult / dApp) enforce:
-  - Correct payload hash.  
-  - Valid signature.  
-  - Attestation presence (and, for production, would validate the quote chain).
+### 4.2 Step‑by‑Step Walkthrough
 
-The result is a chain of trust:
-> L1 anchoring → proof hash → signed proof bundle → TEEMetadata → attestation → enclave identity.
+1. **Batch submission from a client**
+   - Client (could be Vult, dApp backend, or test harness) POSTs to `dapp-server`:
+
+```jsonc
+POST /batch/submit
+{
+  "allocation_id": "89a9f5...",             // dApp's Züs allocation
+  "transactions": [
+    { "id": "tx-0", "payload_b64": "<base64url(json)>" },
+    { "id": "tx-1", "payload_b64": "<base64url(json)>" }
+  ],
+  "key_ttl_seconds": 300,
+  "user_id": "x402-tester"
+}
+```
+
+2. **x402 paywall on the dApp**
+   - `dapp-server/internal/payments/x402.Paywall.Require` runs first:
+     - If `X402_ENABLED=1` and no `X-Payment-ID` header is present, it:
+       - Responds with HTTP 402, body:
+
+```jsonc
+{
+  "type": "x402",
+  "amount": "0.10",
+  "currency": "USDC",
+  "facilitator": "https://facilitator.example",
+  "recipient": "0xRecipient",
+  "network": "base-mainnet",
+  "memo": "dapp.batch.submit",
+  "expires": "...",
+  "invoice": "..."
+}
+```
+
+     - The client (`X402Client`) uses these instructions to call the facilitator, get a `payment_id` + `payment_token`, and retries `/batch/submit` with:
+
+```http
+X-Payment-ID: <payment_id>
+X-Payment-Token: <payment_token_or_simulated>
+```
+
+3. **Encrypt & upload batch with split-key**
+   - In `PostBatchSubmit`:
+     - A new `keyID` is created via `splitkey.Manager.CreateKey`.
+     - Each `payload_b64` is decoded to JSON bytes and passed to `Uploader.UploadBatch`:
+       - A symmetric key (`masterKey`) is derived once per batch.
+       - `UploadBatch`:
+         - Calls `GrantTeeAccess(keyID, keyTTL)` to create a **grant token** scoped to `batch:process`.
+         - AES‑GCM encrypts each tx payload with `masterKey`.
+         - Uses `Storage.Put` (GoSDK + zbox fallback) to write `/batches/<batchID>/tx-*.enc` into the dApp allocation (`DAPP_ALLOCATION_ID`).
+         - Returns `BatchResult` with `Results[]` and `metadataPath`.
+         - Defers `RevokeAllForKey(keyID)` so any outstanding TEEs tokens are purged when done.
+
+4. **Construct split-key `Grant` and call the TEE**
+   - `PostBatchSubmit` builds a `splitkey.Grant`:
+
+```go
+grant := splitkey.Grant{
+    KeyID:        keyID,
+    AllocationID: req.AllocationID,
+    ExpiresAt:    time.Now().Add(keyTTL),
+    Permissions:  []string{"batch:process"},
+}
+if err := splitkey.SignGrant(&grant); err != nil { ... }
+```
+
+   - It then builds `TeeBatchRequest` and calls `TEE.RequestBatch` (via `tee_http_client`), which POSTs to `/api/tee/batch/process` on the TEE:
+
+```jsonc
+POST /api/tee/batch/process
+{
+  "batch_id": "J4e-...",
+  "allocation_id": "89a9f5...",
+  "key_id": "10d4...",
+  "master_key_b64": "<base64(masterKey)>",
+  "grant": {
+    "key_id": "10d4...",
+    "allocation_id": "89a9f5...",
+    "expires_at": "2025-12-05T09:58:19Z",
+    "permissions": ["batch:process"],
+    "signature_b64": "xj/Hqyge3x7v6OR7..."
+  },
+  "entries": [
+    {
+      "tx_id": "tx-x402-0",
+      "remote_path": "batches/J4e.../tx-x402-0.enc",
+      "ciphertext_b64": "<AES-GCM ciphertext>"
+    },
+    ...
+  ]
+}
+```
+
+5. **TEE: verify grant, decrypt, prove, and write back**
+   - In `handleBatchProcess`:
+     - `verifySplitKeyGrant` checks:
+       - `allocation_id` matches.
+       - `key_id` matches.
+       - `expires_at` is in the future.
+       - `permissions` includes `batch:process`.
+       - `signature_b64` matches HMAC‑SHA256 over `{ key_id, allocation_id, expires_at, permissions }` using `ZAUTH_HMAC_SECRET`.
+     - `master_key_b64` is decoded; for each `entry`:
+       - If `ciphertext_b64` is present, decode and decrypt with `decryptAESGCM`.
+       - Compute `txHash = sha256(plaintext)` and build `types.Transaction{ Hash: hex(txHash) }`.
+       - Call `s.prover.GenerateProof(ctx, tx, "flow2-batch-txhash")`, which:
+         - Uses gnark (`gnarkCircuitProver`) when built with `-tags=gnark`.
+         - Runs `txHashCircuit` Groth16, producing `ProofOutput{ Proof, PublicSignals, CircuitID, ProofType="groth16", VerifierKeyID="txhash_bn254_v1" }`.
+       - Build `TEEMetadata` + `TEESignature` and wrap into `SignedProofBundle`.
+       - AES‑GCM encrypt the bundle with `masterKey` and write it back into the dApp allocation under `/batches/<batchId>/<txId>.proof`.
+       - Append to `TeeBatchResponse.Proofs[]`:
+
+```go
+resp.Proofs = append(resp.Proofs, batchProofResult{
+    TxID:           entry.TxID,
+    ProofPath:      proofPath,
+    ProofCipherB64: base64.RawStdEncoding.EncodeToString(encProof),
+    HashHex:        tx.Hash,        // hex-encoded txHash
+    GeneratedAt:    time.Now().Unix(),
+})
+```
+
+6. **dApp verifies proof bundles & marks txs as `verified`**
+   - Back in `PostBatchSubmit`, we call `persistProofs`:
+     - Reconstruct `masterKey` via `h.deps.Keys.ReconstructKey`.
+     - For each `TeeBatchProof`:
+       - Decrypt `ProofCipherB64` with `decryptAESGCMFlow2(masterKey, ...)`.
+       - Call `verifySignedBundle(plain)`, which:
+         - Parses `SignedProofBundle`.
+         - Verifies the Ed25519 `TEESignature` and `TEEMetadata`.
+       - Re‑writes the encrypted proof into the dApp allocation at `ProofPath` for later retrieval.
+       - Updates `rec.TxStatus[txID] = "verified"` and marks `rec.Status = "completed"`.
+   - Clients (including `test-phase1-e2e.ts` and `runFlow2WithX402`) then call:
+     - `GET /batch/status/:batchId` → `status: "completed", tx_status: { tx-0: "verified", ... }`.
+     - `GET /batch/results/:batchId` → list of proof file paths.
+     - `GET /transactions/:txId` → `status: "verified"`.
+
+7. **Batch‑level L1 anchoring & key lifecycle**
+   - Using `runFlow2AndRecordOnL1WithEnv`:
+
+```ts
+const { batchId, status, paymentProcessed, l1TxHashes } =
+  await runFlow2WithX402AndRecordOnL1WithEnv({
+    dappServerUrl: process.env.DAPP_SERVER_URL!,
+    allocation_id: 'phase1-dapp-alloc',
+    transactions: [...],
+    key_ttl_seconds: 300,
+    user_id: 'x402-tester',
+  }, ['base-sepolia']);
+```
+
+   - The helper:
+     - Calls `submitBatch/ status / results` as above to ensure `status === "completed"` and txs are `verified`.
+     - Computes `batchHashHex = sha256(JSON.stringify({ batchId, status, txStatus, proofs }))`.
+     - For each configured L1 target (e.g. Base Sepolia), calls `ZkTxHashRegistry.submitProofHash(keccak256(batchId), batchHashHex)`.
+     - Calls `/batch/cancel/:batchId` to trigger `RevokeAllForKey(keyID)` and cleanup split-key tokens.
 
 ---
 
-## 5. L1/L2 Anchoring and On‑Chain Verification
+## 5. x402 Payment Flows
 
-We separate **off‑chain proving** from **on‑chain anchoring**:
+### 5.1 Server‑Side Paywall
 
-- For Flow 1:
-  - `runFlow1AndRecordOnL1WithEnv` (SDK) runs Flow 1, then:
-    - Computes `sha256(proofBytes)` as `proofHashHex`.  
-    - For each configured chain, calls `ZkTxHashRegistry.submitProofHash(jobIdHash, proofHash)`.  
-  - This gives us:
-    - One off‑chain job per transaction.
-    - One or more L1 transactions that record proof hashes.
+Both `tee-server` and `dapp-server` use the same x402 paywall pattern:
 
-- For Flow 2:
-  - `runFlow2AndRecordOnL1WithEnv`:
-    - Runs the full batch flow.  
-    - Computes a **batch hash** from `{ batchId, status, txStatus, proofs }`.  
-    - Anchors that batch hash on each configured chain via the same registry.  
-    - Cancels the batch (`/batch/cancel/:batchId`) so split‑keys are revoked after settlement.
+- Configuration (`X402_*` envs):
+  - `X402_ENABLED=1` – turn on paywall enforcement.
+  - `X402_FACILITATOR_URL` – URL of the x402 facilitator (e.g. Base USDC paymaster).
+  - `X402_FACILITATOR_API_KEY` – bearer token for the facilitator.
+  - `X402_PRICE_USDC` / `X402_PRICE` – price per call in USDC (e.g. `0.10`).
+  - `X402_CURRENCY` – token symbol (`USDC`, `ADA`, `NIGHT`, etc.).
+  - `X402_RECIPIENT_ADDRESS` – address that receives payment.
+  - `X402_NETWORK` – human‑readable network name (`base-mainnet`, `base-sepolia`, etc.).
+  - `X402_DEV_BYPASS=1` – allow `X-Payment-ID: dev-*` to bypass facilitator in dev.
 
-For deeper integration, `TxProofRegistry` can be used to:
-- Accept full Groth16 proofs (`uint256[8]` arrays).  
-- Call `TxHashVerifier.verifyProof(proof, [txHash])`.  
-- Only if the pairing check passes, forward `(jobIdHash, proofHash)` to `ZkTxHashRegistry`.
+- On each protected endpoint (`/api/tee/jobs/data-request`, `/api/tee/prove`, `/api/tee/batch/process`, `/batch/submit`):
+  - If `X402_ENABLED` and no valid `X-Payment-ID` header:
+    - Build `paymentInstruction` (`type: "x402", amount, currency, facilitator, recipient, memo, network, expires, invoice`).
+    - Return `HTTP 402` + JSON + `X-Payment-Required: x402` headers.
+  - If `X-Payment-ID` present:
+    - Call facilitator `/api/payments/:id` with optional `X-Payment-Token`.
+    - Require `status == "completed"`, `amount >= required`, `currency` and `recipient` match.
 
-This lets us gradually evolve from “hash anchoring” to **full on‑chain proof verification** without changing the off‑chain prover.
+### 5.2 Client‑Side x402 Handling
+
+#### Flow 1 – TEEClient auto‑payment
+
+- `TEEClient.request()` (used by `getAttestation`, `sendAuthTicket`, `pollJob`, etc.):
+
+```ts
+try {
+  const res = await this.http.request<T>({ ... });
+  return res.data;
+} catch (err: any) {
+  const status = err?.response?.status;
+  if (status === 402 && this.x402?.isEnabled()) {
+    const instruction =
+      parsePaymentInstruction(err?.response?.data) ||
+      parseInstructionFromHeaders(err?.response?.headers);
+    ...
+    const receipt = await this.x402.ensurePayment(instruction, { method, urlPath });
+    paymentHeaders = receipt.headers;  // X-Payment-ID / X-Payment-Token
+    continue; // retry original request with payment headers
+  }
+  ...
+}
+```
+
+- `X402Client.ensurePayment`:
+  - In **simulate** mode (`X402_SIMULATE=1` or no facilitator URL):
+    - Mints `paymentId = "dev-<timestamp>"` and returns headers:
+
+```ts
+{
+  paymentId: "dev-...",
+  paymentToken: "simulated",
+  headers: {
+    "X-Payment-ID": "dev-...",
+    "X-Payment-Token": "simulated",
+  }
+}
+```
+
+  - In **real mode**:
+    - POSTs to `X402_FACILITATOR_URL + "/api/payments"` with `{amount, currency, recipient, memo, network, payer_id}`.
+    - Waits for `status: "completed"` and returns `payment_id` + optional `payment_token`.
+
+#### Flow 2 – dApp → TEE (server‑side auto‑payment in dev)
+
+- For the TEE batch endpoint, we added a small convenience in `tee_http_client`:
+  - When `X402_DEV_BYPASS=1` and the first `/api/tee/batch/process` returns `402`:
+    - The client logs the 402 response and **mints a `dev-` payment ID** server‑side.
+    - Retries once with `X-Payment-ID: dev-...` / `X-Payment-Token: simulated`.
+    - This allows end‑to‑end Flow 2 + x402 tests without a live facilitator, while keeping the same contract (facilitator + paywall) for production.
 
 ---
 
-## 6. How This Feels in Vult
+## 6. Security, Key Management & Data Lifecycle
 
-From a user’s perspective, Vult aims to keep all of this complexity hidden:
+### 6.1 PRE & Auth Tickets
 
-- When the user hits **“Send (Private)”**:
-  - Vult encrypts the tx and uploads it to Züs.  
-  - Vult negotiates attestation and PRE with the TEE.  
-  - The TEE privately proves the statement and returns a signed proof bundle.  
-  - Vult revokes sharing and can optionally anchor the proof hash on L1.
+- **Auth tickets** are short‑lived capabilities that grant the TEE read access to specific Züs objects under specific allocations.
+- They are:
+  - Bound to a Züs allocation, path, and recipient `client_id`.
+  - Include a **file content hash**, so the TEE can verify that what it downloads matches what the user intended.
+  - Optionally include a curve25519 re‑encryption key for encrypted‑data flows.
+- `runFlow1` ensures:
+  - The ticket expires quickly (e.g. 1 hour).
+  - A best‑effort `revoke` is issued after proof retrieval, so the window of exposure is small.
 
-- For power users and integrators:
-  - The SDK exposes structured results:
-    - `jobId`, `proofHashHex`, `l1TxHashes`, tx statuses, etc.  
-  - They can plug these into monitoring dashboards, explorers, or compliance tools.
+### 6.2 Split-Keys & Grants (Flow 2)
 
-Under the hood, everything is:
-- **Encrypted at rest** on Züs.  
-- **Decrypted only in the enclave**.  
-- **Proven with real zkSNARKs**.  
-- **Signed and attestable**.  
-- **Optionally anchored on L1** for long‑term verifiability.
+- Each batch gets a unique `keyID` with:
+  - A symmetric AES key split into **infra** and **user** components in `splitkey.Manager`.
+  - `GrantTeeAccess` issues a signed `Grant` containing:
+    - `key_id`, `allocation_id`, `expires_at`, `permissions = ["batch:process"]`, `signature_b64`.
+- On the TEE:
+  - `verifySplitKeyGrant` ensures:
+    - The grant’s allocation and key match the request.
+    - The grant is not expired.
+    - The HMAC signature (using `ZAUTH_HMAC_SECRET`) is valid.
+  - After processing, dApp side calls `RevokeAllForKey`, making any future use of old tokens invalid.
 
+### 6.3 TEE Identity & Attestation
+
+- **Attestation**:
+  - `/attestation` returns `TEEAttestationPackage` plus `TEE`’s public keys:
+    - `tee_public_key_b64` (for Ed25519 signatures).
+    - `tee_curve25519_public_b64` (for PRE).
+    - `mr_enclave` and `quote_provider` (for SGX/Nitro verification).
+- **TEEMetadata**:
+
+```go
+type TEEMetadata struct {
+    ServerID      string
+    ClientID      string
+    Version       string
+    PublicKey     string
+    MREnclave     string
+    QuoteProvider string
+    Attestation   *TEEAttestationPackage
+    Timestamp     int64
+}
+```
+
+  - Included in every `SignedProofBundle` and in Flow 1’s `ProofEnvelopeMetadata`.
+- **TEESignature**:
+  - Ed25519 over `SHA256( { proof, tee_metadata } )`.
+  - Clients verify this signature against `tee_public_key_b64` from `/attestation`.
+
+### 6.4 Data Retention
+
+- **On Züs**:
+  - User tx ciphertexts live in user allocations; lifetime is governed by Vult retention policy.
+  - TEE proof bundles are stored in TEE or dApp allocations and can be:
+    - Retained for auditability (cross‑checking against L1).
+    - Optionally garbage‑collected after a retention window.
+- **On L1**:
+  - Only **hashes** (and, potentially, compressed Groth16 proofs) are stored on chain via `ZkTxHashRegistry` / `TxProofRegistry`.
+
+---
+
+## 7. Vult Integration & User Journey
+
+### 7.1 Wallet‑Level Flow (today)
+
+1. User opens Vult and chooses **“Send privately”**.
+2. Vult calls `runFlow1AndRecordOnL1WithEnv`:
+   - Handles Züs upload, PRE ticket generation, TEE proof, and L1 anchoring.
+3. UI shows:
+   - **Tx status** (pending → proven).
+   - **ZK proof hash** and **L1 anchor tx hash** (e.g. link to BaseScan for `ZkTxHashRegistry`).
+4. Optionally:
+   - Vult can display the full `SignedProofBundle` and allow exporting/sharing as an opaque blob.
+
+### 7.2 dApp / Vult as Batch Controller (Flow 2)
+
+1. A dApp or Vult initiates a **batch transfer** (e.g. payouts, mixer, rollup settlement).
+2. For each user tx, the dApp:
+   - Collects the tx details (amount, to, metadata).
+   - Optionally collects x402 payments from users (USDC/ADA/NIGHT).
+3. dApp calls `runFlow2WithX402...` / `runFlow2AndRecordOnL1WithEnv`:
+   - dApp server handles encryption, split‑key issuance, and Züs upload.
+   - TEE proves each tx and writes proofs back to the dApp’s allocation.
+   - dApp verifies proofs and, once complete, optionally submits verified txs to L1/L2 with proofs.
+4. Vult’s UI can:
+   - Show which user txs are “Included in batch X, verified by TEE Y, anchored at Base Sepolia tx Z”.
+   - Let users view / share proofs for their own txs only.
+
+---
+
+## 8. Summary & Next Steps
+
+With the current codebase:
+
+- **Flow 1** and **Flow 2** are fully wired to:
+  - Real **Züs devnet** storage (user, dApp, TEE allocations via zbox + GoSDK).
+  - A real **TEE prover** (`txHashCircuit` on GNARK/BN254, Groth16) when built with `-tags=gnark`.
+  - **Signed proof bundles** (`SignedProofBundle` + `ProofEnvelope`) with TEEMetadata and Ed25519 signatures.
+  - **x402** paywalls on both TEE and dApp sides, with a test‑mode `dev-` payment path and a ready interface for real USDC/ADA/NIGHT via facilitators.
+  - **L1 anchoring** via `ZkTxHashRegistry` on Base Sepolia for both Flow 1 (per‑job proof hash) and Flow 2 (per‑batch hash), and a ready‑to‑use `TxProofRegistry` for full on‑chain proof verification.
+
+**Next steps:**
+
+1. **Upgrade the circuit:**
+   - Evolve `txHashCircuit` into a richer circuit (e.g., balance checks, spend authorization, range proofs) while preserving the same Groth16 / BN254 pipeline.
+2. **Hook `TxProofRegistry.verifyAndRecord` from the client:**
+   - Extend the SDK to parse gnark proofs into `uint256[8]` and call `verifyAndRecord(jobIdHash, txHash, proofHash, proofArray)` on `TxProofRegistry` for full on‑chain proof verification.
+3. **Real x402 facilitators:**
+   - Stand up or integrate with facilitators for USDC (Base), ADA, and NIGHT, and wire them into `X402Client` and paywalls.
+4. **TEE registration on Züs & L1:**
+   - Implement a TEE registry contract and a validator workflow to bind TEEs’ `MREnclave` and public keys to staked identities, and enforce that in the L1 verifier.
+5. **Vult UX & observability:**
+   - Build dedicated screens for:
+     - Private send / batch send.
+     - Proof status and attestation transparency.
+     - x402 payment flows (what you paid, what you got).
+     - L1 anchoring and cross‑chain audit trails.
 
 
 
