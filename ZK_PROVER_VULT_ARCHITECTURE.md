@@ -198,7 +198,7 @@ const { jobId, proofHashHex, l1TxHashes } =
 - **dApp Server**: owns a Züs allocation and a split‑key manager, handles `/batch/submit` and proof persistence.
 - **TEE Server**: same as Flow 1, but now proving many txs in a batch using a **reconstructed symmetric key**.
 - **Züs Network**: persists both encrypted inputs (txs) and encrypted proof bundles.
-- **L1 Registry**: anchors batch‑level proof hashes (and, later, full proofs) for auditability.
+- **L1 Registry**: anchors batch‑level proof hashes for auditability.
 
 ### 4.2 Step‑by‑Step Walkthrough
 
