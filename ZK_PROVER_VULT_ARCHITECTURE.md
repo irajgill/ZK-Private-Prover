@@ -549,7 +549,7 @@ With the current codebase:
 1. **Upgrade the circuit:**
    - Evolve `txHashCircuit` into a richer circuit (e.g., balance checks, spend authorization, range proofs) while preserving the same Groth16 / BN254 pipeline.
 2. **Hook `TxProofRegistry.verifyAndRecord` from the client:**
-   - Extend the SDK to parse gnark proofs into `uint256[8]` and call `verifyAndRecord(jobIdHash, txHash, proofHash, proofArray)` on `TxProofRegistry` for full on‑chain proof verification.
+   - Extend the SDK to parse gnark proofs into `uint256[8]` and call `verifyAndRecord(jobIdHash, txHash, proofHash, proofArray)` on `TxProofRegistry` for full on‑chain proof verification.(DONE)
 3. **Real x402 facilitators:**
    - Stand up or integrate with facilitators for USDC (Base), ADA, and NIGHT, and wire them into `X402Client` and paywalls.
 4. **TEE registration on Züs & L1:**
