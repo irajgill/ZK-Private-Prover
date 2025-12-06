@@ -506,7 +506,7 @@ type TEEMetadata struct {
 
 ## 7. Vult Integration & User Journey
 
-### 7.1 Wallet‑Level Flow (today)
+### 7.1 Wallet‑Level Flow
 
 1. User opens Vult and chooses **“Send privately”**.
 2. Vult calls `runFlow1AndRecordOnL1WithEnv`:
