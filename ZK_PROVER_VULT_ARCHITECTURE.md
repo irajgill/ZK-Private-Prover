@@ -1,7 +1,6 @@
 ## Züs TEE‑ZK Prover + Vult – Architectural Overview
 
 This document walks through how our **ZK Prover** works with **Vult** to enable **private transactions** on any chain.  
-It’s written for founders, protocol engineers, and wallet devs – the goal is to make the flow understandable without hiding the technical details.
 
 ---
 
@@ -232,7 +231,7 @@ The dApp server:
      - Per‑tx status to **`verified`**.  
      - Batch status to **`completed`**.
 
-An optional monitor (not required for Phase 1) can then:
+An optional monitor can then:
 - Watch for `completed` batches and drive **L1 settlement** (anchoring or full proof verification).
 
 ---
@@ -240,8 +239,7 @@ An optional monitor (not required for Phase 1) can then:
 ## 4. Attestation & Trust Model
 
 - The TEE exposes `/attestation`:
-  - Carries a TEE identity (`client_id`) and public keys.  
-  - In a real deployment this would also contain an AWS Nitro or SGX attestation document.
+  - Carries a TEE identity (`client_id`) and public keys. 
 
 - Every proof bundle includes:
   - **TEEMetadata**, which includes:
@@ -309,7 +307,6 @@ Under the hood, everything is:
 - **Signed and attestable**.  
 - **Optionally anchored on L1** for long‑term verifiability.
 
-That’s the core architectural story behind our ZK Prover with Vult and private transactions.  
-The implementation details (Go/TS files, env vars, deployment scripts) mirror this document almost one‑to‑one, so engineers can move from this overview directly into the codebase. 
+
 
 
